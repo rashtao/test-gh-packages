@@ -10,16 +10,22 @@ import com.arangodb.internal.velocystream.internal.Message;
 import com.arangodb.velocypack.VPack;
 import com.arangodb.velocypack.VPackSlice;
 import com.arangodb.velocystream.Request;
+import com.arangodb.velocystream.RequestType;
 import com.arangodb.velocystream.Response;
+import org.reactivestreams.Publisher;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
+import reactor.netty.NettyInbound;
+import reactor.netty.NettyOutbound;
+import reactor.netty.resources.ConnectionProvider;
 import reactor.netty.tcp.TcpClient;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.concurrent.atomic.AtomicInteger;
 
 
 /**
@@ -28,6 +34,108 @@ import java.nio.ByteOrder;
 public class TcpClientApplication {
     private static final org.slf4j.Logger log = LoggerFactory.getLogger(TcpClientApplication.class);
     private static final byte[] PROTOCOL_HEADER = "VST/1.0\r\n\r\n".getBytes();
+
+    static class ArangoTcpConnection {
+        private NettyOutbound out;
+        private Connection connection;
+        private ConnectionProvider connectionProvider = ConnectionProvider.fixed("tcp");
+
+        public void send(ByteArrayOutputStream authStream) {
+            out.sendByteArray(Mono.just(PROTOCOL_HEADER))
+                    .then(out.sendByteArray(Mono.just(authStream.toByteArray())).then())
+                    .then()
+                    .subscribe();
+        }
+
+        public void connect() {
+            TcpClient.create(connectionProvider)
+                    .wiretap(true)
+                    .host("127.0.0.1")
+                    .port(8529)
+                    .handle(this::handleConnection)
+                    .doOnConnected(c -> {
+                        connection = c;
+                    })
+                    .connect()
+                    .block();
+        }
+
+        private Publisher<Void> handleConnection(NettyInbound in, NettyOutbound out) {
+            this.out = out;
+
+            in.receive()
+                    .asByteArray()
+                    .map(v -> {
+                        int len = v.length;
+                        final Chunk chunk = readChunk(v);
+
+                        ByteBuffer buf = ByteBuffer.wrap(v, len - chunk.getContentLength(), chunk.getContentLength()).order(ByteOrder.LITTLE_ENDIAN);
+                        byte[] arr = new byte[buf.remaining()];
+                        buf.get(arr);
+
+                        return new Message(chunk.getMessageId(), arr);
+                    })
+                    .doOnNext(v -> {
+                        System.out.println("---");
+                        System.out.println(v.getId());
+                        System.out.println(v.getHead());
+                        System.out.println(v.getBody());
+                        System.out.println("---");
+                    })
+                    .subscribe();
+
+            return out.neverComplete();
+        }
+
+        public void disconnect() {
+            this.connection.dispose();
+        }
+
+    }
+
+    public static void main(String[] args) throws IOException, InterruptedException {
+        ArangoTcpConnection conn = new ArangoTcpConnection();
+        conn.connect();
+        Thread.sleep(1000);
+        conn.send(createAuthMessage());
+        Thread.sleep(1000);
+//        conn.send(createVersionRequest());
+//        Thread.sleep(10000);
+        conn.disconnect();
+    }
+
+    private static AtomicInteger messageCounter = new AtomicInteger();
+    private static VPack vpacker = new VPack.Builder().serializeNullValues(false)
+
+            .registerSerializer(Request.class, VPackSerializers.REQUEST)
+            .registerSerializer(AuthenticationRequest.class, VPackSerializers.AUTH_REQUEST)
+
+            .registerDeserializer(Response.class, VPackDeserializers.RESPONSE)
+            .registerDeserializer(CollectionType.class, VPackDeserializers.COLLECTION_TYPE)
+
+            .build();
+
+    private static ByteArrayOutputStream createAuthMessage() throws IOException {
+        VPackSlice auth = vpacker.serialize(new AuthenticationRequest("root", "test", "plain"),
+                new VPack.SerializeOptions().type(AuthenticationRequest.class));
+        final Chunk authChunk = new Chunk(messageCounter.getAndIncrement(), 0, 1, -1, 0, auth.toString().length());
+
+        ByteArrayOutputStream authStream = new ByteArrayOutputStream();
+        authStream.write(getChunkHead(authChunk));
+        authStream.write(auth.getBuffer());
+        return authStream;
+    }
+
+    private static ByteArrayOutputStream createVersionRequest() throws IOException {
+        final Request request = new Request("_system", RequestType.GET, "/_api/version");
+        VPackSlice versionReq = vpacker.serialize(request);
+        final Chunk authChunk = new Chunk(messageCounter.getAndIncrement(), 0, 1, -1, 0, versionReq.toString().length());
+
+        ByteArrayOutputStream authStream = new ByteArrayOutputStream();
+        authStream.write(getChunkHead(authChunk));
+        authStream.write(versionReq.getBuffer());
+        return authStream;
+    }
 
     private static byte[] getChunkHead(final Chunk chunk) {
         final long messageLength = chunk.getMessageLength();
@@ -42,59 +150,6 @@ public class TcpClientApplication {
         }
         return buffer.array();
     }
-
-    public static void main(String[] args) throws IOException {
-        VPack vpacker = new VPack.Builder().serializeNullValues(false)
-
-                .registerSerializer(Request.class, VPackSerializers.REQUEST)
-                .registerSerializer(AuthenticationRequest.class, VPackSerializers.AUTH_REQUEST)
-
-                .registerDeserializer(Response.class, VPackDeserializers.RESPONSE)
-                .registerDeserializer(CollectionType.class, VPackDeserializers.COLLECTION_TYPE)
-
-                .build();
-
-        VPackSlice auth = vpacker.serialize(new AuthenticationRequest("root", "test", "plain"),
-                new VPack.SerializeOptions().type(AuthenticationRequest.class));
-        final Chunk authChunk = new Chunk(1, 0, 1, -1, 0, auth.toString().length());
-
-        ByteArrayOutputStream authStream = new ByteArrayOutputStream();
-        authStream.write(getChunkHead(authChunk));
-        authStream.write(auth.getBuffer());
-
-        Connection connection = TcpClient.create()
-//                .wiretap(true)
-                .host("127.0.0.1")
-                .port(8529)
-                .handle((in, out) ->
-                        out.sendByteArray(Mono.just(PROTOCOL_HEADER))
-                                .then(out.sendByteArray(Mono.just(authStream.toByteArray())).then())
-                                .then(in.receive()
-                                        .asByteArray()
-                                        .map(v -> {
-                                            int len = v.length;
-                                            final Chunk chunk = readChunk(v);
-
-                                            ByteBuffer buf = ByteBuffer.wrap(v, len - chunk.getContentLength(), chunk.getContentLength()).order(ByteOrder.LITTLE_ENDIAN);
-                                            byte[] arr = new byte[buf.remaining()];
-                                            buf.get(arr);
-
-                                            return new Message(chunk.getMessageId(), arr);
-                                        })
-                                        .doOnEach(v -> {
-                                            System.out.println("---");
-                                            System.out.println(v.get().getId());
-                                            System.out.println(v.get().getHead());
-                                            System.out.println(v.get().getBody());
-                                            System.out.println("---");
-                                        })
-                                        .then()
-                                )
-                )
-                .connectNow();
-        connection.onDispose().block();
-    }
-
 
     private static Chunk readChunk(byte[] buffer) {
         final ByteBuffer chunkHeadBuffer = ByteBuffer.wrap(buffer, 0, ArangoDefaults.CHUNK_MIN_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
