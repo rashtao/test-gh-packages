@@ -17,4 +17,4 @@ jobs:
       - name: Info
         run: mvn -version
       - name: Deploy
-        run: mvn deploy -Dregistry=https://maven.pkg.github.com/rashtao/test-gh-packages -Dtoken=${{secrets.GITHUB_TOKEN}} -Dgpg.skip=true -DskipTests=true
+        run: mvn -e --no-transfer-progress deploy -Dregistry=https://maven.pkg.github.com/rashtao/test-gh-packages -Dtoken=${{secrets.GITHUB_TOKEN}} -Dgpg.skip=true -DskipTests=true
